@@ -1,0 +1,29 @@
+name: Notion -> Telegram notifications
+
+on:
+  schedule:
+    # 06:00 Lagos -> 05:00 UTC Mon-Fri
+    - cron: '0 5 * * 1-5'
+    # 17:30 Lagos -> 16:30 UTC Mon-Fri
+    - cron: '30 16 * * 1-5'
+  workflow_dispatch: {}
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+      - name: Install dependencies
+        run: npm ci
+      - name: Run notifier
+        env:
+          NOTION_TOKEN: ${{ secrets.NOTION_TOKEN }}
+          NOTION_DATABASE_ID: ${{ secrets.NOTION_DATABASE_ID }}
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          NOTION_VERSION: '2022-06-28'
+        run: node index.js
