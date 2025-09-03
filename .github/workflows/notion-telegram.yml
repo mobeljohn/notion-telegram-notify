@@ -2,10 +2,8 @@ name: Notion -> Telegram notifications
 
 on:
   schedule:
-    # 06:00 Lagos -> 05:00 UTC Mon-Fri
-    - cron: '0 5 * * 1-5'
-    # 17:30 Lagos -> 16:30 UTC Mon-Fri
-    - cron: '30 16 * * 1-5'
+    # every hour at minute 0 Mon-Fri UTC => picks up Notify Times within an hour
+    - cron: '0 * * * 1-5'
   workflow_dispatch: {}
 
 jobs:
