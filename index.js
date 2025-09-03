@@ -1,3 +1,4 @@
+// index.js - Notion -> Telegram notifier (time-driven, auto-repeat weekdays)
 const axios = require('axios');
 
 const NOTION_TOKEN = process.env.NOTION_TOKEN;
@@ -11,10 +12,35 @@ if (!NOTION_TOKEN || !DATABASE_ID || !TELEGRAM_TOKEN || !TELEGRAM_CHAT_ID) {
   process.exit(1);
 }
 
-// helper: get current Lagos weekday short (Mon, Tue, ...)
-function getLagosWeekdayShort() {
+// return Lagos weekday short, e.g., "Mon"
+function getLagosWeekdayShort(date = new Date()) {
   return new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Lagos', weekday: 'short' })
-    .format(new Date());
+    .format(date);
+}
+
+// add days to an ISO datetime string, returning new ISO
+function addDaysIso(isoStr, days) {
+  const dt = new Date(isoStr);
+  const newDt = new Date(dt.getTime() + days * 24 * 60 * 60 * 1000);
+  return newDt.toISOString();
+}
+
+// compute next business day (skip Sat & Sun) preserving clock time
+function nextBusinessDayIso(isoStr) {
+  // create date in UTC from isoStr, then apply day increments
+  let dt = new Date(isoStr);
+  // add 1 day until it's Mon-Fri
+  for (let i = 1; i <= 7; i++) {
+    const candidate = new Date(dt.getTime() + i * 24 * 60 * 60 * 1000);
+    // get weekday in Lagos to be safe
+    const weekday = new Intl.DateTimeFormat('en-GB', { timeZone: 'Africa/Lagos', weekday: 'short' })
+      .format(candidate);
+    if (weekday !== 'Sat' && weekday !== 'Sun') {
+      return candidate.toISOString();
+    }
+  }
+  // fallback: add 1 day
+  return addDaysIso(isoStr, 1);
 }
 
 // Query Notion DB for Notify = true and Notify Time <= now
@@ -27,14 +53,15 @@ async function notionQuery(nowIso) {
         { property: "Notify Time", date: { on_or_before: nowIso } }
       ]
     },
-    page_size: 50
+    page_size: 100
   };
   const res = await axios.post(url, body, {
     headers: {
       'Authorization': `Bearer ${NOTION_TOKEN}`,
       'Notion-Version': NOTION_VERSION,
       'Content-Type': 'application/json'
-    }
+    },
+    timeout: 15000
   });
   return res.data.results || [];
 }
@@ -55,17 +82,43 @@ async function sendTelegram(text) {
   return res.data;
 }
 
-async function updateNotionPage(pageId, nowIso) {
-  const url = `https://api.notion.com/v1/pages/${pageId}`;
+// Update Notion page: schedule next or disable depending on Repeat
+async function scheduleNextOrDisable(pageId, nowIso, props) {
+  const repeat = props?.Repeat?.select?.name || 'None';
+  const notifyTime = props?.['Notify Time']?.date?.start;
+
+  if (!notifyTime || repeat === 'None') {
+    // One-time: unset Notify and set LastSent
+    const body = {
+      properties: {
+        Notify: { checkbox: false },
+        LastSent: { date: { start: nowIso } }
+      }
+    };
+    await axios.patch(`https://api.notion.com/v1/pages/${pageId}`, body, {
+      headers: {
+        Authorization: `Bearer ${NOTION_TOKEN}`,
+        'Notion-Version': NOTION_VERSION,
+        'Content-Type': 'application/json'
+      }
+    });
+    return;
+  }
+
+  // For Daily: schedule next business day same clock time (skip weekend)
+  let nextIso = nextBusinessDayIso(notifyTime);
+
   const body = {
     properties: {
-      Notify: { checkbox: false },
-      LastSent: { date: { start: nowIso } }
+      LastSent: { date: { start: nowIso } },
+      'Notify Time': { date: { start: nextIso } },
+      Notify: { checkbox: true }
     }
   };
-  await axios.patch(url, body, {
+
+  await axios.patch(`https://api.notion.com/v1/pages/${pageId}`, body, {
     headers: {
-      'Authorization': `Bearer ${NOTION_TOKEN}`,
+      Authorization: `Bearer ${NOTION_TOKEN}`,
       'Notion-Version': NOTION_VERSION,
       'Content-Type': 'application/json'
     }
@@ -74,10 +127,9 @@ async function updateNotionPage(pageId, nowIso) {
 
 (async () => {
   try {
-    // Use UTC now as ISO for Notion date comparison
+    // now in UTC ISO for Notion filters
     const nowUtcIso = new Date().toISOString();
     const pages = await notionQuery(nowUtcIso);
-    const lagosWeekday = getLagosWeekdayShort(); // e.g., "Mon"
 
     if (!pages.length) {
       console.log('No items to notify.');
@@ -86,13 +138,6 @@ async function updateNotionPage(pageId, nowIso) {
 
     for (const p of pages) {
       const props = p.properties || {};
-      // If Notify Days exists, check if it includes current Lagos weekday
-      const days = (props?.['Notify Days']?.multi_select || []).map(s => s.name);
-      if (days.length && !days.includes(lagosWeekday)) {
-        console.log('Skipping page because weekday not matched:', getTitle(props));
-        continue;
-      }
-
       const title = getTitle(props);
       const custom = getCustomMessage(props);
       const notifyTime = props?.['Notify Time']?.date?.start || '—';
@@ -101,9 +146,15 @@ async function updateNotionPage(pageId, nowIso) {
       const message = custom ||
         `Reminder: <b>${title}</b>\nBusiness: ${business}\nTime: ${notifyTime}\n\nThis is an automated reminder.`;
 
-      await sendTelegram(message);
-      await updateNotionPage(p.id, nowUtcIso);
-      console.log('Sent and updated:', title);
+      try {
+        await sendTelegram(message);
+        console.log('Sent:', title);
+        await scheduleNextOrDisable(p.id, nowUtcIso, props);
+        console.log('Scheduled next or disabled:', title);
+      } catch (err) {
+        // Telegram or Notion update failed — log and continue
+        console.error('Send/update error for', title, err?.response?.data || err.message || err);
+      }
     }
   } catch (err) {
     console.error('Error', err?.response?.data || err.message || err);
